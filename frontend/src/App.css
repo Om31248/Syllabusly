@@ -1,0 +1,206 @@
+@import url("https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap");
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --ink: #1c2333;
+  --muted: #6b7280;
+  --paper: #f6f5f1;
+  --line: #dedad0;
+  --navy: #253559;
+  --highlight: #ffd23f;
+  --good: #3f9b5f;
+  --warn: #e0862f;
+  --urgent: #d64545;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Inter", sans-serif;
+}
+
+.page {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 48px 24px 80px;
+}
+
+.header {
+  margin-bottom: 32px;
+}
+
+.header h1 {
+  font-family: "Sora", sans-serif;
+  font-size: 2.2rem;
+  margin: 0 0 4px;
+  letter-spacing: -0.02em;
+}
+
+.header p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 2px dashed var(--line);
+  border-radius: 14px;
+  padding: 48px 24px;
+  cursor: pointer;
+  background: #fff;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.dropzone:hover {
+  border-color: var(--navy);
+}
+
+.dropzone--active {
+  border-color: var(--navy);
+  background: #fbfbf6;
+}
+
+.dropzone__icon {
+  font-size: 2rem;
+  margin-bottom: 4px;
+}
+
+.dropzone__title {
+  font-weight: 600;
+  margin: 0;
+}
+
+.dropzone__hint {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.dropzone__filename {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.error {
+  color: var(--urgent);
+  margin-top: 16px;
+  font-size: 0.9rem;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 28px;
+  color: var(--muted);
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 3px solid var(--line);
+  border-top-color: var(--navy);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.schedule {
+  margin-top: 40px;
+}
+
+.schedule h2 {
+  font-family: "Sora", sans-serif;
+  font-size: 1.3rem;
+  margin-bottom: 16px;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.card {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px;
+}
+
+.card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.course-code {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.78rem;
+  color: var(--navy);
+  background: #eef0f8;
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+
+.badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  color: #fff;
+}
+
+.badge--high {
+  background: var(--urgent);
+}
+
+.badge--medium {
+  background: var(--warn);
+}
+
+.badge--low {
+  background: var(--good);
+}
+
+.card__title {
+  font-family: "Sora", sans-serif;
+  font-size: 1.05rem;
+  margin: 0 0 6px;
+}
+
+.card__due {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0 0 12px;
+}
+
+.card__days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.day-chip {
+  font-size: 0.75rem;
+  background: #fffbe8;
+  border: 1px solid var(--highlight);
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: #7a5c00;
+}
