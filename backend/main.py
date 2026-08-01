@@ -1,30 +1,17 @@
-"""
-Syllabusly backend - main.py
-
-Handles syllabus uploads, pulls text out of the PDF, and asks Gemini to
-turn that into a clean list of assignments/exams/etc. we can hand back
-to the frontend.
-
-Env vars needed (see .env):
-    GEMINI_API_KEY - Google Generative AI key
-
-Run with:
-    uvicorn main:app --reload --port 8000
-"""
-
 import os
 import io
+import re
 import json
 import uuid
 import logging
 from datetime import datetime
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import pypdf
-import google.generativeai as genai
+from groq import Groq
 
 load_dotenv()
 
@@ -45,120 +32,230 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL_NAME = "llama-3.3-70b-versatile"
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+if not GROQ_API_KEY:
+    # load_dotenv() only looks in the cwd (or a parent folder) for a .env.
+    # If yours is somewhere else it just won't find it, no error, key
+    # stays empty. Easiest fix: uncomment these two lines and drop in
+    # the real path.
+    #
+    # load_dotenv("/absolute/path/to/your/.env")
+    # GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    dotenv_path = find_dotenv(usecwd=True)
+    logger.warning(
+        "GROQ_API_KEY not set. Looked for a .env at: %s - move it next "
+        "to main.py, run uvicorn from that folder, or hardcode the path "
+        "above.",
+        dotenv_path or "<not found>",
+    )
+
+client = None
+if GROQ_API_KEY:
+    client = Groq(api_key=GROQ_API_KEY)
 else:
-    # Don't crash the whole app over this - let the server boot so other
-    # routes still work, and just fail this one endpoint loudly with a
-    # useful message instead of a stack trace.
-    logger.warning("GEMINI_API_KEY is not set - /api/upload-syllabus will fail until it is.")
+    logger.warning("GROQ_API_KEY is not set - /api/upload-syllabus will fail until it is.")
 
 VALID_TYPES = {"Exam", "Assignment", "Quiz", "Project"}
-VALID_PRIORITIES = {"High", "Medium", "Low"}
 
 DEFAULT_YEAR = 2026
 
+# Hard ceiling on what we'll ever send to the model, even after trimming.
+# Last line of defense against a genuinely massive document (some syllabi
+# run 30+ pages with huge appendices) blowing the token budget anyway.
+MAX_PROMPT_CHARS = 9000
+
+# If a page scores at least this many keyword hits, we treat it as likely
+# to contain real gradeable content and keep it. Deliberately generic -
+# these words show up on an assessments/schedule page in pretty much any
+# syllabus template, not just this one school's.
+PAGE_KEEP_THRESHOLD = 3
+
+RELEVANT_KEYWORDS = (
+    "assignment", "assessment", "exam", "midterm", "final exam",
+    "quiz", "project", "presentation", "due date", "deadline",
+    "worth", "weight", "grade", "grading", "%", "percent",
+    "course schedule", "week 1", "week 2", "submission", "report",
+    "evaluation", "marks",
+)
+
+# Pages that are mostly about these topics are almost never useful for
+# extraction, even if a stray word overlaps with the keyword list above
+# (e.g. a policy page that mentions "grade" once in passing). If a page
+# trips several of these, that's a strong signal it's pure policy text.
+BOILERPLATE_KEYWORDS = (
+    "academic integrity", "accessibility", "accessible learning",
+    "plagiarism", "code of conduct", "human rights", "gender inclusiv",
+    "intellectual property", "student privacy", "wellness centre",
+    "aacsb", "copyright act", "religious accommodation", "mental health",
+)
+
 
 # ---------------------------------------------------------------------------
-# helpers
+# pdf extraction
 # ---------------------------------------------------------------------------
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Pull all the text we can out of a PDF. Raises ValueError if there's
-    basically nothing usable in there (scanned image syllabus, etc.)."""
+def extract_pages_from_pdf(file_bytes):
+    """Pull text out of a PDF, keeping pages separate rather than joining
+    into one blob right away.
+
+    This matters because PDF text extraction is unreliable about
+    preserving paragraph breaks - a lot of PDFs extract as one giant wall
+    of text with no blank lines anywhere, which makes "split on blank
+    lines" useless for figuring out which chunk is about what. Page
+    boundaries, on the other hand, are always reliable, since pypdf gives
+    them to us directly."""
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
 
     if len(reader.pages) == 0:
         raise ValueError("PDF has no pages")
 
-    pages_text = []
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        pages_text.append(page_text)
+    pages_text = [page.extract_text() or "" for page in reader.pages]
 
-    full_text = "\n".join(pages_text).strip()
-
-    # A PDF with no extractable text is almost always a scanned image with
-    # no OCR layer - pypdf can't do anything with that.
-    if len(full_text) < 40:
+    total_len = sum(len(p) for p in pages_text)
+    if total_len < 40:
         raise ValueError("Could not extract meaningful text from PDF (likely scanned/image-based)")
 
-    return full_text
+    return pages_text
 
 
-def build_prompt(syllabus_text: str) -> str:
-    # Truncate defensively - some syllabi have huge appendices we don't need
-    # and it just burns tokens for no benefit.
-    trimmed = syllabus_text[:15000]
+# ---------------------------------------------------------------------------
+# text cleanup + relevance filtering
+# ---------------------------------------------------------------------------
 
-    return f"""You are an assistant that extracts graded course deliverables from a
-university course syllabus. Read the syllabus text below and identify every
-assignment, quiz, midterm, project, and final exam that has a weight and/or
-due date associated with it.
+def strip_page_furniture(page_text: str) -> str:
+    """Drop the stuff that repeats on nearly every page and adds nothing
+    useful: lone page numbers, address/phone footers, bare URLs sitting
+    on their own line. None of this is school-specific - it's just "does
+    this line look like a footer" regardless of what the footer says."""
+    cleaned_lines = []
 
-Do not assume any particular course - determine the course code directly
-from whatever appears in the document itself (e.g. "CS135", "ECON101",
-"MATH128", "HIST201"). Different syllabi will have entirely different
-course codes and you must extract whatever is actually present, not a
-fixed or example value.
+    for line in page_text.split("\n"):
+        stripped = line.strip()
 
-Return ONLY a valid JSON array. No markdown formatting, no code fences, no
-commentary before or after it - just the raw JSON array, because it will be
-parsed directly with json.loads().
+        if not stripped:
+            cleaned_lines.append(line)
+            continue
 
-Each object in the array must have exactly these fields:
-- "course_code": string, extracted from the syllabus header/title. Infer it
-  from context if it isn't repeated near each item, but never invent a
-  code that doesn't appear in the document.
-- "title": string, short descriptive name, e.g. "Midterm Exam 1" or
-  "Case Study Analysis"
-- "due_date": string in YYYY-MM-DD format. If the syllabus gives a date
-  without a year, assume {DEFAULT_YEAR}. If a date genuinely cannot be
-  determined at all, use "TBD".
-- "type": one of "Exam", "Assignment", "Quiz", "Project"
-- "weight": integer percentage of the final grade, e.g. 20. If not stated,
-  make a reasonable estimate of 0.
-- "priority": one of "High", "Medium", "Low" based on weight -
-  above 15% is High, 5% to 15% is Medium, below 5% is Low
-- "estimated_hours": integer, a reasonable estimate of hours a student would
-  need to prepare for or complete this item, based on its type and weight
+        if re.fullmatch(r"\d{1,4}", stripped):
+            continue  # lone page number
 
-Do not include lecture readings, participation marks with no fixed date, or
-anything that isn't a discrete gradeable item.
+        looks_like_footer = (
+            re.search(r"\b\d{3}[.\-]\d{3}[.\-]\d{4}\b", stripped)
+            or re.search(r"\b(ave|avenue|street|st\.|blvd|road|rd\.)\b", stripped, re.IGNORECASE)
+            or (len(stripped) < 90 and re.search(r"\.(ca|com|edu|org)\b", stripped, re.IGNORECASE))
+        )
+        if looks_like_footer:
+            continue
 
-Syllabus text:
+        cleaned_lines.append(line)
+
+    collapsed = "\n".join(cleaned_lines)
+    collapsed = re.sub(r"\n{3,}", "\n\n", collapsed)
+    return collapsed.strip()
+
+
+def score_page(page_text: str) -> int:
+    """Count how many "this page is probably about grades/deadlines"
+    keywords show up, minus a penalty for boilerplate keywords. Simple,
+    but works fine for deciding which pages are worth sending."""
+    lowered = page_text.lower()
+
+    relevance_hits = sum(1 for kw in RELEVANT_KEYWORDS if kw in lowered)
+    boilerplate_hits = sum(1 for kw in BOILERPLATE_KEYWORDS if kw in lowered)
+
+    return relevance_hits - boilerplate_hits
+
+
+def select_relevant_pages(pages_text: list) -> str:
+    """Clean each page, score it, and keep only the pages that look like
+    they're actually about gradeable deliverables. Falls back to using
+    every cleaned page if scoring somehow leaves us with almost nothing -
+    better to send more than to send an empty prompt."""
+    cleaned_pages = [strip_page_furniture(p) for p in pages_text]
+
+    kept_pages = [
+        page for page in cleaned_pages
+        if score_page(page) >= PAGE_KEEP_THRESHOLD
+    ]
+
+    combined = "\n\n".join(kept_pages)
+
+    if len(combined) < 300:
+        combined = "\n\n".join(cleaned_pages)
+
+    return combined
+
+
+def prepare_syllabus_text(pages_text: list) -> str:
+    """Full pipeline: clean + filter down to relevant pages, then apply a
+    hard character cap as a final safety net."""
+    focused = select_relevant_pages(pages_text)
+    return focused[:MAX_PROMPT_CHARS]
+
+
+# ---------------------------------------------------------------------------
+# prompt + model call
+# ---------------------------------------------------------------------------
+
+def build_prompt(pages_text: list) -> str:
+    trimmed = prepare_syllabus_text(pages_text)
+
+    # Note: we don't ask the model for "priority" - that gets computed
+    # from weight afterward (see derive_priority). Fewer fields to explain
+    # means a shorter prompt every single call.
+    return f"""Extract every graded deliverable (assignment, quiz, midterm, project,
+final exam - anything with a due date and/or grade weight) from the syllabus
+excerpt below. This excerpt has already been trimmed down to the sections
+most likely to contain that information, from a syllabus for an unknown
+course.
+
+Figure out the course code from whatever appears in the text itself - do
+not guess or invent one if it isn't present.
+
+Return ONLY a JSON array, nothing else - no code fences, no commentary.
+Each item needs exactly these fields:
+- course_code: string, taken from the document, "UNKNOWN" if truly absent
+- title: short name, e.g. "Midterm Exam" or "Case Study Analysis"
+- due_date: "YYYY-MM-DD" (assume {DEFAULT_YEAR} if year is missing, else "TBD")
+- type: one of Exam, Assignment, Quiz, Project
+- weight: integer percent of final grade, 0 if not stated
+- estimated_hours: integer, a reasonable prep-time estimate for this item
+
+Skip readings, participation-only items with no fixed date, and anything
+that isn't a discrete gradeable deliverable.
+
+Syllabus excerpt:
 ---
 {trimmed}
 ---
 """
 
 
-def call_gemini(prompt: str) -> str:
-    """Ask Gemini to do the extraction.
-
-    We tell it explicitly to respond with application/json - this is the
-    actual fix for the "model wraps everything in ```json fences" problem,
-    instead of trying to regex/strip our way around it after the fact.
-    Much more reliable and it saves us a chunk of cleanup code too.
-    """
-    model = genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config={
-            "response_mime_type": "application/json",
-            "temperature": 0.2,  # keep it consistent, this isn't a creative task
-        },
+def call_groq(prompt: str) -> str:
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You output JSON only, no commentary."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"},
     )
-    response = model.generate_content(prompt)
-    return response.text
+    return completion.choices[0].message.content
 
 
 def clean_json_response(raw_text: str) -> list:
-    """Even with response_mime_type set, be defensive - older SDK versions
-    or edge cases can still hand back stray whitespace/fences, so we just
-    grab the outermost [ ... ] before handing it to json.loads."""
+    """Grab the outermost [ ... ] before parsing, just to be safe against
+    stray whitespace or fences.
+
+    Heads up: the Groq call uses response_format={"type": "json_object"},
+    which means the model technically has to return an object, not a bare
+    array. If it wraps things like {"items": [...]}, this still works fine
+    since we're just scanning for brackets - but if it returns an object
+    with no array anywhere inside, this blows up on purpose instead of
+    quietly returning garbage."""
     text = raw_text.strip().strip("`")
 
     start = text.find("[")
@@ -174,9 +271,14 @@ def clean_json_response(raw_text: str) -> list:
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# normalization (computed ourselves instead of trusting the model, so the
+# prompt can stay short and the output is always guaranteed consistent)
+# ---------------------------------------------------------------------------
+
 def safe_int(value, default: int = 0) -> int:
-    """Little helper so we're not repeating the same try/except everywhere -
-    Gemini occasionally hands back "20%" or "20.0" instead of a clean int."""
+    """The model occasionally hands back "20%" or "20.0" instead of a clean
+    int - this just saves repeating the same try/except everywhere."""
     try:
         return int(float(str(value).strip().rstrip("%")))
     except (TypeError, ValueError):
@@ -192,9 +294,8 @@ def derive_priority(weight: int) -> str:
 
 
 def normalize_due_date(raw_date) -> str:
-    """Coerce whatever Gemini gives us into YYYY-MM-DD or "TBD". Handles the
-    common case of a year-less date (e.g. "03-15") by assuming DEFAULT_YEAR,
-    since we ask for that in the prompt but the model doesn't always comply."""
+    """Coerce whatever comes back into YYYY-MM-DD or "TBD". Handles a
+    year-less date (e.g. "03-15") by assuming DEFAULT_YEAR."""
     if not raw_date or raw_date == "TBD":
         return "TBD"
 
@@ -217,20 +318,15 @@ def normalize_due_date(raw_date) -> str:
 
 def normalize_item(item: dict) -> dict:
     """Fill in gaps / coerce types so the frontend never chokes on a
-    malformed item coming back from the model. This is our real safety
-    net - even if Gemini gets a field wrong or skips one, everything
-    that leaves this function is guaranteed to match the shape the
-    frontend expects."""
+    malformed item. Priority is computed here from weight rather than
+    asked of the model - it's deterministic, so there's no reason to
+    spend prompt space explaining the High/Medium/Low cutoffs."""
     weight = safe_int(item.get("weight"), default=0)
     estimated_hours = safe_int(item.get("estimated_hours"), default=0)
 
     item_type = item.get("type")
     if item_type not in VALID_TYPES:
         item_type = "Assignment"
-
-    priority = item.get("priority")
-    if priority not in VALID_PRIORITIES:
-        priority = derive_priority(weight)
 
     due_date = normalize_due_date(item.get("due_date"))
 
@@ -241,7 +337,7 @@ def normalize_item(item: dict) -> dict:
         "due_date": due_date,
         "type": item_type,
         "weight": weight,
-        "priority": priority,
+        "priority": derive_priority(weight),
         "estimated_hours": estimated_hours,
     }
 
@@ -268,8 +364,8 @@ async def upload_syllabus(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported right now.")
 
-    if not GEMINI_API_KEY:
-        return fallback_response("Server is missing GEMINI_API_KEY - contact the administrator.")
+    if not GROQ_API_KEY:
+        return fallback_response("Server is missing GROQ_API_KEY - contact the administrator.")
 
     try:
         file_bytes = await file.read()
@@ -277,9 +373,9 @@ async def upload_syllabus(file: UploadFile = File(...)):
         logger.exception("Failed to read uploaded file")
         return fallback_response("Could not read the uploaded file.")
 
-    # Step 1: pull text out of the PDF
+    # Step 1: pull text out of the PDF, page by page
     try:
-        syllabus_text = extract_text_from_pdf(file_bytes)
+        pages_text = extract_pages_from_pdf(file_bytes)
     except ValueError as e:
         logger.warning(f"PDF extraction issue for {file.filename}: {e}")
         return fallback_response(str(e))
@@ -287,16 +383,16 @@ async def upload_syllabus(file: UploadFile = File(...)):
         logger.exception(f"Unexpected error extracting text from {file.filename}")
         return fallback_response("Unexpected error while reading the PDF.")
 
-    # Step 2 + 3: send to Gemini and get structured JSON back
+    # Step 2 + 3: trim down to the relevant pages, send to Groq, parse JSON
     try:
-        prompt = build_prompt(syllabus_text)
-        raw_response = call_gemini(prompt)
+        prompt = build_prompt(pages_text)
+        raw_response = call_groq(prompt)
         parsed_items = clean_json_response(raw_response)
     except json.JSONDecodeError:
-        logger.exception("Gemini response was not valid JSON")
+        logger.exception("Groq response was not valid JSON")
         return fallback_response("The AI response could not be parsed. Please try again.")
     except Exception:
-        logger.exception("Gemini extraction failed")
+        logger.exception("Groq extraction failed")
         return fallback_response("AI extraction failed. Please try again in a moment.")
 
     # Step 4: normalize + validate each item before handing it back

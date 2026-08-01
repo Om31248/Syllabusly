@@ -7,7 +7,7 @@ const STORAGE_KEY = "syllabusly.tasks";
 const PRIORITY_META = {
   High: { icon: "🔥", label: "High" },
   Medium: { icon: "🟡", label: "Medium" },
-  Low: { icon: "🟢", label: "Low" },
+  Low: { icon: "🔵", label: "Low" },
 };
 
 function loadStoredTasks() {
@@ -26,6 +26,101 @@ function formatDue(dateStr) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+function hasRealDate(dateStr) {
+  return Boolean(dateStr) && dateStr !== "TBD" && !Number.isNaN(new Date(`${dateStr}T00:00:00`).getTime());
+}
+
+// All the date math below treats due_date as a plain YYYY-MM-DD calendar
+// day, not a timestamp - that's why we build Date objects at noon UTC
+// instead of midnight local time, so timezone offsets can never push us
+// onto the wrong day.
+function toCompactDate(dateStr) {
+  return dateStr.replaceAll("-", "");
+}
+
+function addDays(dateStr, days) {
+  const d = new Date(`${dateStr}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function nowAsICSTimestamp() {
+  return new Date().toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
+}
+
+function escapeICSText(str) {
+  return String(str)
+    .replace(/\\/g, "\\\\")
+    .replace(/;/g, "\\;")
+    .replace(/,/g, "\\,")
+    .replace(/\n/g, "\\n");
+}
+
+function buildICS(tasks) {
+  const scheduled = tasks.filter((t) => hasRealDate(t.due_date));
+  const stamp = nowAsICSTimestamp();
+
+  const events = scheduled.map((t) => {
+    const start = toCompactDate(t.due_date);
+    const end = toCompactDate(addDays(t.due_date, 1));
+    const summary = escapeICSText(`${t.course_code}: ${t.title}`);
+    const description = escapeICSText(
+      `${t.type} · ${t.weight}% of final grade · ~${t.estimated_hours}h estimated`
+    );
+
+    return [
+      "BEGIN:VEVENT",
+      `UID:${t.id}@syllabusly.app`,
+      `DTSTAMP:${stamp}`,
+      `DTSTART;VALUE=DATE:${start}`,
+      `DTEND;VALUE=DATE:${end}`,
+      `SUMMARY:${summary}`,
+      `DESCRIPTION:${description}`,
+      "END:VEVENT",
+    ].join("\r\n");
+  });
+
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Syllabusly//Term Planner//EN",
+    "CALSCALE:GREGORIAN",
+    ...events,
+    "END:VCALENDAR",
+  ].join("\r\n");
+}
+
+function downloadICS(tasks) {
+  const ics = buildICS(tasks);
+  const blob = new Blob([ics], { type: "text/calendar;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "syllabusly-schedule.ics";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function googleCalendarUrl(task) {
+  if (!hasRealDate(task.due_date)) return null;
+
+  const start = toCompactDate(task.due_date);
+  const end = toCompactDate(addDays(task.due_date, 1));
+  const details = `${task.type} · ${task.weight}% of final grade · ~${task.estimated_hours}h estimated study time`;
+
+  const params = new URLSearchParams({
+    action: "TEMPLATE",
+    text: `${task.course_code}: ${task.title}`,
+    dates: `${start}/${end}`,
+    details,
+  });
+
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
 function TaskCard({ task, onUpdate, onDelete }) {
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingDue, setEditingDue] = useState(false);
@@ -33,6 +128,7 @@ function TaskCard({ task, onUpdate, onDelete }) {
   const [dueDraft, setDueDraft] = useState(task.due_date || "");
 
   const priority = PRIORITY_META[task.priority] || PRIORITY_META.Low;
+  const gcalUrl = googleCalendarUrl(task);
 
   const commitTitle = () => {
     setEditingTitle(false);
@@ -52,7 +148,7 @@ function TaskCard({ task, onUpdate, onDelete }) {
 
       <div className="card__top">
         <span className="badge-course">{task.course_code}</span>
-        <span className="badge-priority" title={`${priority.label} priority`}>
+        <span className="badge-priority" data-priority={task.priority} title={`${priority.label} priority`}>
           {priority.icon} {priority.label}
         </span>
       </div>
@@ -104,6 +200,12 @@ function TaskCard({ task, onUpdate, onDelete }) {
         <span>{task.estimated_hours}h est.</span>
       </div>
 
+      {gcalUrl && (
+        <a className="card__gcal" href={gcalUrl} target="_blank" rel="noopener noreferrer">
+          + Add to Google Calendar
+        </a>
+      )}
+
       <div className="card__footer">
         <span className="card__type">{task.type}</span>
         <button className="btn-delete" onClick={() => onDelete(task.id)}>
@@ -140,6 +242,15 @@ export default function App() {
       .sort((a, b) => (a.due_date || "9999").localeCompare(b.due_date || "9999"));
   }, [tasks, search, activeCourse]);
 
+  const summary = useMemo(
+    () => ({
+      count: tasks.length,
+      weight: tasks.reduce((sum, t) => sum + (Number(t.weight) || 0), 0),
+      hours: tasks.reduce((sum, t) => sum + (Number(t.estimated_hours) || 0), 0),
+    }),
+    [tasks]
+  );
+
   async function handleFiles(fileList) {
     const files = Array.from(fileList).filter((f) => f.type === "application/pdf");
     if (!files.length) {
@@ -159,7 +270,12 @@ export default function App() {
         if (!res.ok) throw new Error(`Upload failed for ${file.name} (${res.status})`);
 
         const data = await res.json();
-        const incoming = Array.isArray(data) ? data : data.tasks || [];
+
+        if (data.success === false) {
+          throw new Error(data.error || `Couldn't extract anything from ${file.name}.`);
+        }
+
+        const incoming = Array.isArray(data) ? data : data.items || [];
         setTasks((prev) => [...prev, ...incoming]);
       }
     } catch (err) {
@@ -229,6 +345,27 @@ export default function App() {
 
       {tasks.length > 0 && (
         <>
+          <div className="dashboard">
+            <div className="metric-card">
+              <span className="metric-card__value">{summary.count}</span>
+              <span className="metric-card__label">Total Deliverables</span>
+            </div>
+            <div className="metric-card">
+              <span className="metric-card__value">{summary.weight}%</span>
+              <span className="metric-card__label">Cumulative Weight</span>
+            </div>
+            <div className="metric-card">
+              <span className="metric-card__value">{summary.hours}h</span>
+              <span className="metric-card__label">Estimated Study Time</span>
+            </div>
+          </div>
+
+          <div className="actions-bar">
+            <button className="btn-export" onClick={() => downloadICS(tasks)}>
+              ⬇ Export All to Calendar (.ics)
+            </button>
+          </div>
+
           <div className="controls">
             <input
               className="search-input"
