@@ -82,6 +82,14 @@ BOILERPLATE_KEYWORDS = (
     "aacsb", "copyright act", "religious accommodation", "mental health",
 )
 
+EVAL_TABLE_MARKERS = (
+    "student evaluation", "grading scheme", "grade breakdown",
+    "evaluation scheme", "assessments", "weight due date",
+    "evaluation", "grade distribution",
+)
+
+COURSE_CODE_RE = re.compile(r"\b[A-Z]{2,4}[-\s]?\d{3}[A-Z0-9-]*\b")
+
 
 def extract_pages_from_pdf(file_bytes):
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
@@ -136,12 +144,21 @@ def score_page(page_text: str) -> int:
 def select_relevant_pages(pages_text: list) -> str:
     cleaned_pages = [strip_page_furniture(p) for p in pages_text]
 
-    kept_pages = [
-        page for page in cleaned_pages
-        if score_page(page) >= PAGE_KEEP_THRESHOLD
-    ]
+    pinned = []
+    scored = []
+    for i, page in enumerate(cleaned_pages):
+        lowered = page.lower()
+        is_pinned = (
+            i == 0
+            or any(marker in lowered for marker in EVAL_TABLE_MARKERS)
+            or COURSE_CODE_RE.search(page)
+        )
+        if is_pinned:
+            pinned.append(page)
+        elif score_page(page) >= PAGE_KEEP_THRESHOLD:
+            scored.append(page)
 
-    combined = "\n\n".join(kept_pages)
+    combined = "\n\n".join(pinned + scored)
 
     if len(combined) < 300:  # filtering nuked everything, fall back to raw pages
         combined = "\n\n".join(cleaned_pages)
@@ -186,7 +203,7 @@ Each item needs exactly these fields:
 - title: short name, e.g. "Midterm Exam" or "Case Study Analysis"
 - due_date: "YYYY-MM-DD" (assume {DEFAULT_YEAR} if year is missing, else "TBD")
 - type: one of Exam, Assignment, Quiz, Project
-- weight: integer percent of final grade, 0 if not stated
+- weight: number, percent of final grade (decimals like 0.5 are fine), 0 if not stated
 - estimated_hours: integer, a reasonable prep-time estimate for this item
 
 Skip readings, participation-only items with no fixed date, and anything
@@ -234,7 +251,14 @@ def safe_int(value, default: int = 0) -> int:
         return default
 
 
-def derive_priority(weight: int) -> str:
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        return round(float(str(value).strip().rstrip("%")), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def derive_priority(weight: float) -> str:
     if weight > 15:
         return "High"
     if weight >= 5:
@@ -264,7 +288,7 @@ def normalize_due_date(raw_date) -> str:
 
 
 def normalize_item(item: dict) -> dict:
-    weight = safe_int(item.get("weight"), default=0)
+    weight = safe_float(item.get("weight"), default=0.0)
     estimated_hours = safe_int(item.get("estimated_hours"), default=0)
 
     item_type = item.get("type")
@@ -297,7 +321,7 @@ def weight_sum_warning(items: list) -> Optional[str]:
         return None  # syllabus probably just didn't have percentages, not worth warning about
 
     if total_weight < low or total_weight > high:
-        return f"Extracted weights add up to {total_weight}%, not ~100% - some items may be missing or mis-weighted. Worth double-checking against the syllabus."
+        return f"Extracted weights add up to {round(total_weight, 1)}%, not ~100% - some items may be missing or mis-weighted. Worth double-checking against the syllabus."
 
     return None
 
@@ -380,7 +404,7 @@ class TaskInput(BaseModel):
     title: str
     course_code: str
     due_date: str
-    weight: int
+    weight: float
     estimated_hours: int
 
 
@@ -411,22 +435,22 @@ MIN_SESSION_HOURS = 0.5
 MAX_SESSION_HOURS = 1.5
 
 
-def session_length_for(weight: int) -> float:
+def session_length_for(weight: float) -> float:
     # weight 0 -> ~1.5h/day, weight 40+ -> ~0.5h/day, linear between
     dose = MAX_SESSION_HOURS - (weight / 40) * (MAX_SESSION_HOURS - MIN_SESSION_HOURS)
     return round(max(MIN_SESSION_HOURS, min(MAX_SESSION_HOURS, dose)), 2)
 
 
-def lead_days_for(weight: int, estimated_hours: int) -> int:
+def lead_days_for(weight: float, estimated_hours: int) -> int:
     session_len = session_length_for(weight)
     hours_driven = math.ceil(estimated_hours / session_len) if estimated_hours > 0 else 1
     # heavier stuff starts earlier even if the hours are light (e.g. a final)
-    weight_driven = 2 + weight // 4
+    weight_driven = 2 + int(weight // 4)
     return max(hours_driven, weight_driven, 1)
 
 
 def place_session(day_totals, day_key, hours):
-   
+
     # never gets skipped just because the window is tight
     day_totals[day_key] = day_totals.get(day_key, 0) + hours
     return day_key
@@ -482,7 +506,7 @@ def generate_schedule(payload: ScheduleRequest):
             hours_left -= chunk
             day += timedelta(days=1)
 
-        
+
         # instead of skipping the task
         if hours_left > 0:
             day_key = place_session(day_totals, due_date.strftime("%Y-%m-%d"), hours_left)

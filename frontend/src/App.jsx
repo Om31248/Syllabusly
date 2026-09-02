@@ -371,6 +371,17 @@ export default function App() {
     [tasks]
   );
 
+  const summaryByCourse = useMemo(() => {
+    const byCourse = {};
+    for (const t of tasks) {
+      if (!byCourse[t.course_code]) byCourse[t.course_code] = { count: 0, weight: 0, hours: 0 };
+      byCourse[t.course_code].count += 1;
+      byCourse[t.course_code].weight += Number(t.weight) || 0;
+      byCourse[t.course_code].hours += Number(t.estimated_hours) || 0;
+    }
+    return byCourse;
+  }, [tasks]);
+
   const busiestWeek = useMemo(() => {
     const buckets = {};
     for (const t of tasks) {
@@ -623,10 +634,23 @@ export default function App() {
                 <span className="metric__value">{summary.count}</span>
                 <span className="metric__label">Deliverables</span>
               </div>
-              <div className="metric">
-                <span className="metric__value">{summary.weight}%</span>
-                <span className="metric__label">Weight</span>
-              </div>
+
+              {activeCourse === "All Courses" ? (
+                Object.entries(summaryByCourse).map(([course, s]) => (
+                  <div className="metric" key={course}>
+                    <span className="metric__value">{Math.round(s.weight * 10) / 10}%</span>
+                    <span className="metric__label">{course} Weight</span>
+                  </div>
+                ))
+              ) : (
+                <div className="metric">
+                  <span className="metric__value">
+                    {Math.round((summaryByCourse[activeCourse]?.weight || 0) * 10) / 10}%
+                  </span>
+                  <span className="metric__label">Weight</span>
+                </div>
+              )}
+
               <div className="metric">
                 <span className="metric__value">{summary.hours}h</span>
                 <span className="metric__label">Prep Time</span>
@@ -1001,6 +1025,7 @@ html, body, #root {
 .toolbar__metrics {
   display: flex;
   gap: 22px;
+  flex-wrap: wrap;
   flex-shrink: 0;
 }
 
