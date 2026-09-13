@@ -106,6 +106,13 @@ body {
   cursor: pointer;
   transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
 }
+.latency-note {
+  margin-top: 10px;
+  font-size: 12.5px;
+  font-family: "IBM Plex Mono", monospace;
+  color: var(--accent-2);
+  text-align: center;
+}
 
 .dropzone:hover {
   border-color: var(--border-hover);

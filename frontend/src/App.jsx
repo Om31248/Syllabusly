@@ -334,6 +334,7 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [errors, setErrors] = useState([]);
+  const [lastLatencyMs, setLastLatencyMs] = useState(null);
 
   const fileInputRef = useRef(null);
 
@@ -456,6 +457,9 @@ export default function App() {
 
         if (data.warning) {
           collectedErrors.push(`${file.name}: ${data.warning}`);
+        }
+        if (typeof data.latency_ms === "number") {
+          setLastLatencyMs(data.latency_ms);
         }
       } catch (err) {
         collectedErrors.push(err.message || `Something went wrong reading ${file.name}.`);
@@ -591,6 +595,12 @@ export default function App() {
         <div className="landing">
           {dropzone}
 
+          {lastLatencyMs !== null && errors.length === 0 && (
+            <p className="latency-note">
+              ⚡ Extracted in {lastLatencyMs < 1000 ? `${Math.round(lastLatencyMs)}ms` : `${(lastLatencyMs / 1000).toFixed(1)}s`}
+            </p>
+          )}
+
           {errors.length > 0 && (
             <div className="banner banner--error">
               {errors.map((msg, i) => (
@@ -612,6 +622,12 @@ export default function App() {
       ) : (
         <>
           {dropzone}
+
+          {lastLatencyMs !== null && errors.length === 0 && (
+            <p className="latency-note">
+              ⚡ Extracted in {lastLatencyMs < 1000 ? `${Math.round(lastLatencyMs)}ms` : `${(lastLatencyMs / 1000).toFixed(1)}s`}
+            </p>
+          )}
 
           {errors.length > 0 && (
             <div className="banner banner--error">
@@ -927,6 +943,14 @@ html, body, #root {
   font-weight: 400;
   color: var(--text-muted);
   margin-left: 6px;
+}
+
+.latency-note {
+  margin-top: 10px;
+  font-size: 12.5px;
+  font-family: "IBM Plex Mono", monospace;
+  color: var(--accent-2);
+  text-align: center;
 }
 
 .spinner {
